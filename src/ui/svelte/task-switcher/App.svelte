@@ -58,16 +58,8 @@
 </div>
 
 <style>
-  :global(html),
-  :global(body),
-  :global(#root) {
-    width: 100%;
-    height: 100%;
-    margin: 0;
-    background: transparent;
-  }
-
   :global(body) {
     overflow: hidden;
+    background: transparent;
   }
 </style>
