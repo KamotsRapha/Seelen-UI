@@ -16,12 +16,11 @@ use crate::{
 
 /// Mirrors `getWindowsForItem` from the frontend (`windows.ts`).
 ///
-/// Grouping rules:
-///   1. Window has a umid  → matched only by exact umid equality. Path is not used.
-///      If no item has that umid, a new item will be created for it.
-///   2. Window has no umid → matched by exact path (item.relaunch.command or item.path).
+/// Prefer exact UMID matches, but fall back to the executable path when the window advertises
+/// a different UMID than the pinned item. Some apps (including desktop apps like WeChat) use
+/// different UMIDs on their shortcut and window, even though both belong to the same executable.
 ///
-/// note: on update of this function check src\ui\react\weg\modules\shared\state\windows.ts both should work the same
+/// note: on update of this function check src\\ui\\svelte\\weg\\state\\windows.svelte.ts too.
 fn get_windows_for_item<'a>(
     item: &WegItemData,
     interactables: &'a [UserAppWindow],
@@ -32,8 +31,8 @@ fn get_windows_for_item<'a>(
     interactables
         .iter()
         .filter(|w| {
-            if w.umid.is_some() {
-                return item.umid == w.umid;
+            if item.umid.is_some() && item.umid == w.umid {
+                return true;
             }
 
             let win_path = w
