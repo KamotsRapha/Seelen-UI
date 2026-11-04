@@ -1,18 +1,125 @@
-general:
-  accent_color: Accent color
-  date_format: Date format
-  date_format_how_to: How to write a date format?
-  game_mode_suspend_behavior: Game Mode widget behavior
-  game_mode_suspend_behavior_description: >-
-    Controls what Seelen does while Windows Game Mode is active. "Keep task switcher"
-    leaves Alt+Tab available, while "Pause Alt+Tab capture" disables Seelen's task-switcher
-    hotkeys so Windows handles the switch.
-  game_mode_suspend_behavior_options:
-    keep_task_switcher: Keep task switcher available
-    pause_alt_tab_capture: Pause Alt+Tab capture
-    suspend_all: Suspend all widgets
-  hardware_acceleration: Hardware acceleration
-  hardware_acceleration_description: >-
-    Disabling hardware acceleration will reduce memory usage. It is safe to
-    disable if you are not using heavy animations, though individual widgets may
-    still force GPU usage regardless of this setting.
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicBool, Ordering},
+};
+
+use seelen_core::{
+    resource::WidgetId,
+    state::{WidgetLoader, WidgetStatus},
+};
+
+use crate::{
+    error::{Result, ResultLogExt},
+    modules::monitors::MonitorManager,
+    resources::RESOURCES,
+    state::application::FULL_STATE,
+    utils::lock_free::SyncHashMap,
+    widgets::{WidgetWebviewLabel, loader::WidgetDeployment},
+};
+
+pub static WIDGET_MANAGER: LazyLock<WidgetManager> = LazyLock::new(WidgetManager::create);
+pub static GAME_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub struct WidgetManager {
+    /// group of widgets instances by widget resource id
+    pub deployments: SyncHashMap<WidgetId, WidgetDeployment>,
+}
+
+impl WidgetManager {
+    fn create() -> Self {
+        let sub_id = MonitorManager::subscribe(|_event| {
+            WIDGET_MANAGER.reconcile().log_error();
+        });
+        MonitorManager::set_event_handler_priority(&sub_id, 1);
+        Self {
+            deployments: SyncHashMap::new(),
+        }
+    }
+
+    pub fn is_ready(&self, label: &WidgetWebviewLabel) -> bool {
+        self.deployments
+            .get(&label.widget_id, |deploy| {
+                deploy.pods.any(|(key, pod)| key == label && pod.is_ready())
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn set_status(&self, label: &WidgetWebviewLabel, status: WidgetStatus) {
+        self.deployments.get(&label.widget_id, |deploy| {
+            deploy.pods.get(label, |instance| {
+                instance.set_status(status);
+            });
+        });
+    }
+
+    pub fn suspend_all(&self) {
+        GAME_MODE_ACTIVE.store(true, Ordering::Release);
+        self.deployments.for_each(|(id, deploy)| {
+            if id == WidgetId::known_task_switcher() {
+                return;
+            }
+            deploy.pods.clear();
+        });
+    }
+
+    pub fn resume_all(&self) -> Result<()> {
+        GAME_MODE_ACTIVE.store(false, Ordering::Release);
+        self.reconcile()
+    }
+
+    pub fn reconcile(&self) -> Result<()> {
+        // remove deleted resources
+        self.deployments
+            .retain(|(key, _)| RESOURCES.widgets.contains_sync(key));
+
+        let mut filtered = Vec::new();
+        RESOURCES.widgets.iter_sync(|k, w| {
+            if w.loader != WidgetLoader::Legacy {
+                filtered.push((k.clone(), w.clone()));
+            }
+            true
+        });
+
+        let state = FULL_STATE.load();
+        for (id, widget) in filtered {
+            if !state.is_widget_enabled(&id) {
+                self.deployments.remove(&id);
+                continue;
+            }
+
+            if !self.deployments.contains_key(&id) {
+                self.deployments
+                    .upsert(id.clone(), WidgetDeployment::new(widget));
+            }
+        }
+
+        // lazy creation of webviews to reduce startup time
+        std::thread::spawn(|| {
+            fn reconcile(deployment: &WidgetDeployment) {
+                deployment.reconcile();
+                if !deployment.definition.lazy && !GAME_MODE_ACTIVE.load(Ordering::Acquire) {
+                    deployment.start_all_webviews();
+                }
+            }
+
+            // More visual widgets load first
+            for priority in [
+                WidgetId::known_wall(),
+                WidgetId::known_toolbar(),
+                WidgetId::known_weg(),
+            ] {
+                WIDGET_MANAGER.deployments.get(&priority, |deployment| {
+                    reconcile(deployment);
+                });
+            }
+
+            // All other widgets
+            WIDGET_MANAGER.deployments.for_each(|(_, deployment)| {
+                reconcile(deployment);
+            });
+        });
+
+        Ok(())
+    }
+}
+

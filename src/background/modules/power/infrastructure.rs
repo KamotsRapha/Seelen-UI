@@ -1,114 +1,63 @@
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use seelen_core::{
     handlers::SeelenEvent,
-    state::GameModeSuspendBehavior,
-    system_state::{Battery, PowerMode, PowerStatus},
+    state::shortcuts::{ResolvedShortcut, resolve_shortcuts, system_shortcut_declarations},
 };
-use windows::Win32::System::Shutdown::{
-    EWX_LOGOFF, SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_OPERATINGSYSTEM,
-    SHTDN_REASON_MINOR_UPGRADE, SHTDN_REASON_NONE, SHUTDOWN_FLAGS, SHUTDOWN_INSTALL_UPDATES,
-    SHUTDOWN_POWEROFF, SHUTDOWN_REASON, SHUTDOWN_RESTART,
-};
+use slu_ipc::messages::SvcAction;
 
 use crate::{
-    app::emit_to_webviews,
-    cli::shortcuts::sync_shortcuts_for_game_mode,
-    error::{Result, ResultLogExt},
-    modules::power::application::{PowerManager, PowerManagerEvent, has_pending_os_updates},
+    app::emit_to_webviews, cli::ServicePipe, error::Result, resources::RESOURCES,
     state::application::FULL_STATE,
-    utils::lock_free::TracedMutex,
-    widgets::manager::WIDGET_MANAGER,
-    windows_api::WindowsApi,
 };
 
-/// Lazy initialization wrapper that registers Tauri events on first access
-/// This keeps Tauri logic separate from system logic while ensuring lazy initialization
-fn get_power_manager() -> &'static TracedMutex<PowerManager> {
-    static TAURI_EVENT_REGISTRATION: Once = Once::new();
-    TAURI_EVENT_REGISTRATION.call_once(|| {
-        PowerManager::subscribe(|event| match event {
-            PowerManagerEvent::PowerStatusChanged(status) => {
-                emit_to_webviews(SeelenEvent::PowerStatus, status);
-            }
-            PowerManagerEvent::BatteriesChanged(batteries) => {
-                emit_to_webviews(SeelenEvent::BatteriesStatus, batteries);
-            }
-            PowerManagerEvent::PowerModeChanged(mode) => {
-                if FULL_STATE.load().settings.suspend_on_game_mode {
-                    let behaviour = FULL_STATE.load().settings.game_mode_suspend_behavior;
-                    match mode {
-                        PowerMode::GameMode => {
-                            WIDGET_MANAGER.suspend_all_for_game_mode(behaviour);
-                            if behaviour == GameModeSuspendBehavior::PauseAltTabCapture {
-                                sync_shortcuts_for_game_mode(true, behaviour).log_error();
-                            }
-                        }
-                        _ => {
-                            WIDGET_MANAGER.resume_all().log_error();
-                            sync_shortcuts_for_game_mode(false, behaviour).log_error();
-                        }
-                    }
-                }
-                emit_to_webviews(SeelenEvent::PowerMode, mode);
-            }
-        });
-    });
-    PowerManager::instance()
+pub static SHORTCUTS_PAUSED: AtomicBool = AtomicBool::new(false);
+
+pub fn toggle_pause() -> Result<()> {
+    let was_paused = SHORTCUTS_PAUSED.fetch_xor(true, Ordering::SeqCst);
+    let now_paused = !was_paused;
+    if now_paused {
+        send_pause_only()?;
+    } else {
+        send_all()?;
+    }
+    emit_to_webviews(SeelenEvent::ShortcutsPaused, now_paused);
+    Ok(())
 }
 
-impl crate::tauri_handlers::Handlers {
-    pub fn get_power_status() -> PowerStatus {
-        get_power_manager().lock().power_status.clone()
-    }
-
-    pub fn get_power_mode() -> PowerMode {
-        get_power_manager().lock().power_mode
-    }
-
-    pub fn get_batteries() -> Vec<Battery> {
-        get_power_manager().lock().batteries.clone()
-    }
-
-    pub fn log_out() {
-        WindowsApi::exit_windows(EWX_LOGOFF, SHTDN_REASON_NONE).log_error();
-    }
-
-    pub fn suspend() {
-        WindowsApi::set_suspend_state(false).log_error();
-    }
-
-    pub fn hibernate() {
-        WindowsApi::set_suspend_state(true).log_error();
-    }
-
-    pub fn has_pending_os_updates() -> bool {
-        has_pending_os_updates()
-    }
-
-    pub fn restart(install_updates: Option<bool>) -> Result<()> {
-        initiate_shutdown(SHTDN_REASON_NONE, install_updates.unwrap_or(false))
-    }
-
-    pub fn shutdown(install_updates: Option<bool>) -> Result<()> {
-        initiate_shutdown(SHTDN_REASON_NONE, install_updates.unwrap_or(false))
-    }
-
-    pub fn lock() -> Result<()> {
-        WindowsApi::lock_machine()?;
-        Ok(())
-    }
+fn send_all() -> Result<()> {
+    let state = FULL_STATE.load();
+    let widgets = RESOURCES.widgets();
+    let widget_refs: Vec<_> = widgets.iter().map(|w| w.as_ref()).collect();
+    let (resolved, _) = resolve_shortcuts(&state.settings, &widget_refs);
+    ServicePipe::request(SvcAction::SetShortcuts(resolved))
 }
 
-/// Updates are only applied when explicitly requested, mirroring the shell's
-/// "Shut down" vs "Update and shut down" options.
-fn initiate_shutdown(mut flags: SHUTDOWN_FLAGS, install_updates: bool) -> Result<()> {
-    let mut reason: SHUTDOWN_REASON = SHTDN_REASON_NONE;
-    if install_updates {
-        flags |= SHUTDOWN_INSTALL_UPDATES;
-        reason = SHTDN_REASON_FLAG_PLANNED
-            | SHTDN_REASON_MAJOR_OPERATINGSYSTEM
-            | SHTDN_REASON_MINOR_UPGRADE;
-    }
-    WindowsApi::initiate_shutdown(flags, reason)
+fn send_pause_only() -> Result<()> {
+    let state = FULL_STATE.load();
+    let decls = system_shortcut_declarations();
+    let shortcuts = decls
+        .iter()
+        .find(|d| d.id == "shortcuts-pause-toggle")
+        .and_then(|d| {
+            let keys = state
+                .settings
+                .shortcuts
+                .shortcuts
+                .get("shortcuts-pause-toggle")
+                .cloned()
+                .unwrap_or_else(|| d.default_keys.clone());
+            if keys.is_empty() {
+                None
+            } else {
+                Some(ResolvedShortcut {
+                    command: d.command.clone(),
+                    keys,
+                })
+            }
+        })
+        .into_iter()
+        .collect();
+    ServicePipe::request(SvcAction::SetShortcuts(shortcuts))
 }
+

@@ -1,130 +1,104 @@
-use std::sync::{
-    LazyLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Once;
 
 use seelen_core::{
-    resource::WidgetId,
-    state::{GameModeSuspendBehavior, WidgetLoader, WidgetStatus},
+    handlers::SeelenEvent,
+    system_state::{Battery, PowerMode, PowerStatus},
+};
+use windows::Win32::System::Shutdown::{
+    EWX_LOGOFF, SHTDN_REASON_FLAG_PLANNED, SHTDN_REASON_MAJOR_OPERATINGSYSTEM,
+    SHTDN_REASON_MINOR_UPGRADE, SHTDN_REASON_NONE, SHUTDOWN_FLAGS, SHUTDOWN_INSTALL_UPDATES,
+    SHUTDOWN_POWEROFF, SHUTDOWN_REASON, SHUTDOWN_RESTART,
 };
 
 use crate::{
+    app::emit_to_webviews,
     error::{Result, ResultLogExt},
-    modules::monitors::MonitorManager,
-    resources::RESOURCES,
+    modules::power::application::{PowerManager, PowerManagerEvent, has_pending_os_updates},
     state::application::FULL_STATE,
-    utils::lock_free::SyncHashMap,
-    widgets::{WidgetWebviewLabel, loader::WidgetDeployment},
+    utils::lock_free::TracedMutex,
+    widgets::manager::WIDGET_MANAGER,
+    windows_api::WindowsApi,
 };
 
-pub static WIDGET_MANAGER: LazyLock<WidgetManager> = LazyLock::new(WidgetManager::create);
-pub static GAME_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-pub struct WidgetManager {
-    /// group of widgets instances by widget resource id
-    pub deployments: SyncHashMap<WidgetId, WidgetDeployment>,
+/// Lazy initialization wrapper that registers Tauri events on first access
+/// This keeps Tauri logic separate from system logic while ensuring lazy initialization
+fn get_power_manager() -> &'static TracedMutex<PowerManager> {
+    static TAURI_EVENT_REGISTRATION: Once = Once::new();
+    TAURI_EVENT_REGISTRATION.call_once(|| {
+        PowerManager::subscribe(|event| match event {
+            PowerManagerEvent::PowerStatusChanged(status) => {
+                emit_to_webviews(SeelenEvent::PowerStatus, status);
+            }
+            PowerManagerEvent::BatteriesChanged(batteries) => {
+                emit_to_webviews(SeelenEvent::BatteriesStatus, batteries);
+            }
+            PowerManagerEvent::PowerModeChanged(mode) => {
+                if FULL_STATE.load().settings.suspend_on_game_mode {
+                    match mode {
+                        PowerMode::GameMode => WIDGET_MANAGER.suspend_all(),
+                        _ => WIDGET_MANAGER.resume_all().log_error(),
+                    }
+                }
+                emit_to_webviews(SeelenEvent::PowerMode, mode);
+            }
+        });
+    });
+    PowerManager::instance()
 }
 
-impl WidgetManager {
-    fn create() -> Self {
-        let sub_id = MonitorManager::subscribe(|_event| {
-            WIDGET_MANAGER.reconcile().log_error();
-        });
-        MonitorManager::set_event_handler_priority(&sub_id, 1);
-        Self {
-            deployments: SyncHashMap::new(),
-        }
+impl crate::tauri_handlers::Handlers {
+    pub fn get_power_status() -> PowerStatus {
+        get_power_manager().lock().power_status.clone()
     }
 
-    pub fn is_ready(&self, label: &WidgetWebviewLabel) -> bool {
-        self.deployments
-            .get(&label.widget_id, |deploy| {
-                deploy.pods.any(|(key, pod)| key == label && pod.is_ready())
-            })
-            .unwrap_or(false)
+    pub fn get_power_mode() -> PowerMode {
+        get_power_manager().lock().power_mode
     }
 
-    pub fn set_status(&self, label: &WidgetWebviewLabel, status: WidgetStatus) {
-        self.deployments.get(&label.widget_id, |deploy| {
-            deploy.pods.get(label, |instance| {
-                instance.set_status(status);
-            });
-        });
+    pub fn get_batteries() -> Vec<Battery> {
+        get_power_manager().lock().batteries.clone()
     }
 
-    pub fn suspend_all(&self) {
-        self.suspend_all_for_game_mode(GameModeSuspendBehavior::SuspendAll);
+    pub fn log_out() {
+        WindowsApi::exit_windows(EWX_LOGOFF, SHTDN_REASON_NONE).log_error();
     }
 
-    pub fn suspend_all_for_game_mode(&self, behavior: GameModeSuspendBehavior) {
-        GAME_MODE_ACTIVE.store(true, Ordering::Release);
-        self.deployments.for_each(|(id, deploy)| {
-            if matches!(behavior, GameModeSuspendBehavior::KeepTaskSwitcher)
-                && id == WidgetId::known_task_switcher()
-            {
-                return;
-            }
-            deploy.pods.clear();
-        });
+    pub fn suspend() {
+        WindowsApi::set_suspend_state(false).log_error();
     }
 
-    pub fn resume_all(&self) -> Result<()> {
-        GAME_MODE_ACTIVE.store(false, Ordering::Release);
-        self.reconcile()
+    pub fn hibernate() {
+        WindowsApi::set_suspend_state(true).log_error();
     }
 
-    pub fn reconcile(&self) -> Result<()> {
-        // remove deleted resources
-        self.deployments
-            .retain(|(key, _)| RESOURCES.widgets.contains_sync(key));
+    pub fn has_pending_os_updates() -> bool {
+        has_pending_os_updates()
+    }
 
-        let mut filtered = Vec::new();
-        RESOURCES.widgets.iter_sync(|k, w| {
-            if w.loader != WidgetLoader::Legacy {
-                filtered.push((k.clone(), w.clone()));
-            }
-            true
-        });
+    pub fn restart(install_updates: Option<bool>) -> Result<()> {
+        initiate_shutdown(SHUTDOWN_RESTART, install_updates.unwrap_or(false))
+    }
 
-        let state = FULL_STATE.load();
-        for (id, widget) in filtered {
-            if !state.is_widget_enabled(&id) {
-                self.deployments.remove(&id);
-                continue;
-            }
+    pub fn shutdown(install_updates: Option<bool>) -> Result<()> {
+        initiate_shutdown(SHUTDOWN_POWEROFF, install_updates.unwrap_or(false))
+    }
 
-            if !self.deployments.contains_key(&id) {
-                self.deployments
-                    .upsert(id.clone(), WidgetDeployment::new(widget));
-            }
-        }
-
-        // lazy creation of webviews to reduce startup time
-        std::thread::spawn(|| {
-            fn reconcile(deployment: &WidgetDeployment) {
-                deployment.reconcile();
-                if !deployment.definition.lazy && !GAME_MODE_ACTIVE.load(Ordering::Acquire) {
-                    deployment.start_all_webviews();
-                }
-            }
-
-            // More visual widgets load first
-            for priority in [
-                WidgetId::known_wall(),
-                WidgetId::known_toolbar(),
-                WidgetId::known_weg(),
-            ] {
-                WIDGET_MANAGER.deployments.get(&priority, |deployment| {
-                    reconcile(deployment);
-                });
-            }
-
-            // All other widgets
-            WIDGET_MANAGER.deployments.for_each(|(_, deployment)| {
-                reconcile(deployment);
-            });
-        });
-
+    pub fn lock() -> Result<()> {
+        WindowsApi::lock_machine()?;
         Ok(())
     }
 }
+
+/// Updates are only applied when explicitly requested, mirroring the shell's
+/// "Shut down" vs "Update and shut down" options.
+fn initiate_shutdown(mut flags: SHUTDOWN_FLAGS, install_updates: bool) -> Result<()> {
+    let mut reason: SHUTDOWN_REASON = SHTDN_REASON_NONE;
+    if install_updates {
+        flags |= SHUTDOWN_INSTALL_UPDATES;
+        reason = SHTDN_REASON_FLAG_PLANNED
+            | SHTDN_REASON_MAJOR_OPERATINGSYSTEM
+            | SHTDN_REASON_MINOR_UPGRADE;
+    }
+    WindowsApi::initiate_shutdown(flags, reason)
+}
+
