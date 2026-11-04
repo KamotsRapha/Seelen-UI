@@ -2,6 +2,7 @@ use std::sync::Once;
 
 use seelen_core::{
     handlers::SeelenEvent,
+    state::GameModeSuspendBehavior,
     system_state::{Battery, PowerMode, PowerStatus},
 };
 use windows::Win32::System::Shutdown::{
@@ -12,6 +13,7 @@ use windows::Win32::System::Shutdown::{
 
 use crate::{
     app::emit_to_webviews,
+    cli::shortcuts::sync_shortcuts_for_game_mode,
     error::{Result, ResultLogExt},
     modules::power::application::{PowerManager, PowerManagerEvent, has_pending_os_updates},
     state::application::FULL_STATE,
@@ -34,9 +36,18 @@ fn get_power_manager() -> &'static TracedMutex<PowerManager> {
             }
             PowerManagerEvent::PowerModeChanged(mode) => {
                 if FULL_STATE.load().settings.suspend_on_game_mode {
+                    let behaviour = FULL_STATE.load().settings.game_mode_suspend_behavior;
                     match mode {
-                        PowerMode::GameMode => WIDGET_MANAGER.suspend_all(),
-                        _ => WIDGET_MANAGER.resume_all().log_error(),
+                        PowerMode::GameMode => {
+                            WIDGET_MANAGER.suspend_all_for_game_mode(behaviour);
+                            if behaviour == GameModeSuspendBehavior::PauseAltTabCapture {
+                                sync_shortcuts_for_game_mode(true, behaviour).log_error();
+                            }
+                        }
+                        _ => {
+                            WIDGET_MANAGER.resume_all().log_error();
+                            sync_shortcuts_for_game_mode(false, behaviour).log_error();
+                        }
                     }
                 }
                 emit_to_webviews(SeelenEvent::PowerMode, mode);
@@ -76,11 +87,11 @@ impl crate::tauri_handlers::Handlers {
     }
 
     pub fn restart(install_updates: Option<bool>) -> Result<()> {
-        initiate_shutdown(SHUTDOWN_RESTART, install_updates.unwrap_or(false))
+        initiate_shutdown(SHTDN_REASON_NONE, install_updates.unwrap_or(false))
     }
 
     pub fn shutdown(install_updates: Option<bool>) -> Result<()> {
-        initiate_shutdown(SHUTDOWN_POWEROFF, install_updates.unwrap_or(false))
+        initiate_shutdown(SHTDN_REASON_NONE, install_updates.unwrap_or(false))
     }
 
     pub fn lock() -> Result<()> {

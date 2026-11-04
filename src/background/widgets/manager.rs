@@ -5,7 +5,7 @@ use std::sync::{
 
 use seelen_core::{
     resource::WidgetId,
-    state::{WidgetLoader, WidgetStatus},
+    state::{GameModeSuspendBehavior, WidgetLoader, WidgetStatus},
 };
 
 use crate::{
@@ -53,8 +53,17 @@ impl WidgetManager {
     }
 
     pub fn suspend_all(&self) {
+        self.suspend_all_for_game_mode(GameModeSuspendBehavior::SuspendAll);
+    }
+
+    pub fn suspend_all_for_game_mode(&self, behavior: GameModeSuspendBehavior) {
         GAME_MODE_ACTIVE.store(true, Ordering::Release);
-        self.deployments.for_each(|(_, deploy)| {
+        self.deployments.for_each(|(id, deploy)| {
+            if matches!(behavior, GameModeSuspendBehavior::KeepTaskSwitcher)
+                && id == WidgetId::known_task_switcher()
+            {
+                return;
+            }
             deploy.pods.clear();
         });
     }

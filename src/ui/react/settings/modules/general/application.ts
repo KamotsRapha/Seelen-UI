@@ -122,6 +122,23 @@ export function setSuspendOnGameMode(suspendOnGameMode: boolean) {
 }
 
 /**
+ * Gets the Game Mode suspend behavior setting
+ */
+export function getGameModeSuspendBehavior(): string {
+  return settings.value.gameModeSuspendBehavior ?? "keepTaskSwitcher";
+}
+
+/**
+ * Sets the Game Mode suspend behavior setting
+ */
+export function setGameModeSuspendBehavior(gameModeSuspendBehavior: string) {
+  settings.value = {
+    ...settings.value,
+    gameModeSuspendBehavior,
+  };
+}
+
+/**
  * Patches the performance mode settings with partial updates
  */
 export function patchPerformanceMode(patch: Partial<PerformanceModeSettings>) {

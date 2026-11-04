@@ -2,7 +2,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use seelen_core::{
     handlers::SeelenEvent,
-    state::shortcuts::{ResolvedShortcut, resolve_shortcuts, system_shortcut_declarations},
+    state::{
+        GameModeSuspendBehavior,
+        shortcuts::{ResolvedShortcut, resolve_shortcuts, system_shortcut_declarations},
+    },
 };
 use slu_ipc::messages::SvcAction;
 
@@ -23,6 +26,35 @@ pub fn toggle_pause() -> Result<()> {
     }
     emit_to_webviews(SeelenEvent::ShortcutsPaused, now_paused);
     Ok(())
+}
+
+pub fn sync_shortcuts_for_game_mode(
+    game_mode_active: bool,
+    behavior: GameModeSuspendBehavior,
+) -> Result<()> {
+    if SHORTCUTS_PAUSED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    let state = FULL_STATE.load();
+    let widgets = RESOURCES.widgets();
+    let widget_refs: Vec<_> = widgets.iter().map(|w| w.as_ref()).collect();
+    let (resolved, _) = resolve_shortcuts(&state.settings, &widget_refs);
+
+    let filtered = if game_mode_active && behavior == GameModeSuspendBehavior::PauseAltTabCapture {
+        resolved
+            .into_iter()
+            .filter(|shortcut| {
+                !(shortcut.command.len() >= 3
+                    && shortcut.command[0] == "task-switcher"
+                    && matches!(shortcut.command[1].as_str(), "select-next-task" | "select-previous-task"))
+            })
+            .collect()
+    } else {
+        resolved
+    };
+
+    ServicePipe::request(SvcAction::SetShortcuts(filtered))
 }
 
 fn send_all() -> Result<()> {

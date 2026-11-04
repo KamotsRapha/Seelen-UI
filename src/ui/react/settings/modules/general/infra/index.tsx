@@ -7,12 +7,14 @@ import { startup } from "../../shared/tauri/infra.ts";
 import { autostart } from "../../../state/system.ts";
 import {
   getDateFormat,
+  getGameModeSuspendBehavior,
   getHardwareAcceleration,
   getLanguage,
   getPollingInterval,
   getStartOfWeek,
   getSuspendOnGameMode,
   setDateFormat,
+  setGameModeSuspendBehavior,
   setHardwareAcceleration,
   setLanguage,
   setPollingInterval,
@@ -33,6 +35,7 @@ export function General() {
   const hardwareAcceleration = getHardwareAcceleration();
   const pollingInterval = getPollingInterval();
   const suspendOnGameMode = getSuspendOnGameMode();
+  const gameModeSuspendBehavior = getGameModeSuspendBehavior();
 
   const { t } = useTranslation();
 
@@ -136,6 +139,32 @@ export function General() {
           label={t("general.suspend_on_game_mode")}
           description={t("general.suspend_on_game_mode_description")}
           action={<Switch onChange={setSuspendOnGameMode} checked={suspendOnGameMode} />}
+        />
+
+        <SettingsOption
+          label={t("general.game_mode_suspend_behavior")}
+          description={t("general.game_mode_suspend_behavior_description")}
+          action={
+            <Select
+              style={{ width: "260px" }}
+              value={gameModeSuspendBehavior}
+              options={[
+                {
+                  label: t("general.game_mode_suspend_behavior_options.suspend_all"),
+                  value: "suspendAll",
+                },
+                {
+                  label: t("general.game_mode_suspend_behavior_options.keep_task_switcher"),
+                  value: "keepTaskSwitcher",
+                },
+                {
+                  label: t("general.game_mode_suspend_behavior_options.pause_alt_tab_capture"),
+                  value: "pauseAltTabCapture",
+                },
+              ]}
+              onSelect={(value) => setGameModeSuspendBehavior(value)}
+            />
+          }
         />
 
         <SettingsOption
