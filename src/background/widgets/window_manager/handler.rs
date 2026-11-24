@@ -1,23 +1,23 @@
 use std::{collections::HashMap, sync::Once};
 
 use slu_ipc::messages::SvcAction;
-use windows::Win32::UI::WindowsAndMessaging::SW_NORMAL;
 
 use crate::{
     app::emit_to_webviews,
     cli::ServicePipe,
     error::Result,
-    state::application::{FULL_STATE, performance::PERFORMANCE_MODE},
+    platform::window::{Window, WindowState},
+    state::{FULL_STATE, PERFORMANCE_MODE},
     widgets::{
         permissions::{WidgetPerm, request_widget_permission},
         window_manager::state_v2::{TwmState, WM_STATE},
     },
-    windows_api::{WindowsApi, window::Window},
 };
 use seelen_core::{
     handlers::SeelenEvent,
     rect::Rect,
     state::{PerformanceMode, TwmGlobalRuntimeTree},
+    system_state::{WindowHandle, WindowIdentity},
 };
 
 /// Adds the shadow offset to `rect`, unmaximizing `window` first if needed. Returns `None` if
@@ -29,15 +29,17 @@ fn desired_rect_for(window: &Window, rect: &Rect) -> Result<Option<Rect>> {
     }
 
     if window.is_maximized() {
-        window.show_window(SW_NORMAL)?; // unmaximize
+        window.set_state(WindowState::Normal)?; // unmaximize
     }
 
-    let shadow = WindowsApi::shadow_rect(window.hwnd())?;
+    // the invisible borders (drop shadow) are outside the visible frame
+    let outer = window.outer_rect()?;
+    let inner = window.inner_rect()?;
     Ok(Some(Rect {
-        top: rect.top + shadow.top,
-        left: rect.left + shadow.left,
-        right: rect.right + shadow.right,
-        bottom: rect.bottom + shadow.bottom,
+        top: rect.top + outer.top - inner.top,
+        left: rect.left + outer.left - inner.left,
+        right: rect.right + outer.right - inner.right,
+        bottom: rect.bottom + outer.bottom - inner.bottom,
     }))
 }
 
@@ -59,7 +61,7 @@ pub fn set_app_window_position(window: &Window, rect: Rect) -> Result<()> {
         state.settings.by_widget.wm.animations.enabled && perf_mode == PerformanceMode::Disabled;
 
     let mut list = HashMap::new();
-    list.insert(window.address(), desired_rect);
+    list.insert(window.handle(), desired_rect);
 
     ServicePipe::request(SvcAction::DeferWindowPositions {
         list,
@@ -70,7 +72,7 @@ pub fn set_app_window_position(window: &Window, rect: Rect) -> Result<()> {
     Ok(())
 }
 
-pub fn set_app_windows_positions(positions: HashMap<isize, Rect>) -> Result<()> {
+pub fn set_app_windows_positions(positions: HashMap<WindowHandle, Rect>) -> Result<()> {
     log::trace!(
         "set_app_windows_positions called with {} positions",
         positions.len()
@@ -78,10 +80,10 @@ pub fn set_app_windows_positions(positions: HashMap<isize, Rect>) -> Result<()> 
 
     let mut list = HashMap::new();
 
-    for (hwnd, rect) in &positions {
-        let window = Window::from(*hwnd);
+    for (&hwnd, rect) in &positions {
+        let window = Window::from(hwnd);
         if let Some(desired_rect) = desired_rect_for(&window, rect)? {
-            list.insert(*hwnd, desired_rect);
+            list.insert(hwnd, desired_rect);
         }
     }
 
@@ -93,9 +95,9 @@ pub fn set_app_windows_positions(positions: HashMap<isize, Rect>) -> Result<()> 
     // Store inner (pre-shadow) rects — must match Window::inner_rect() used in comparisons.
     {
         let mut state = WM_STATE.lock();
-        for hwnd in list.keys() {
-            if let Some(rect) = positions.get(hwnd) {
-                state.set_cached_node_rect(*hwnd, rect.clone());
+        for (&hwnd, rect) in &positions {
+            if list.contains_key(&hwnd) {
+                state.set_cached_node_rect(hwnd, rect.clone());
             }
         }
     }
@@ -125,18 +127,26 @@ impl crate::tauri_handlers::Handlers {
 
     pub fn set_app_windows_positions(
         webview: tauri::WebviewWindow,
-        positions: HashMap<isize, Rect>,
+        positions: HashMap<WindowIdentity, Rect>,
     ) -> Result<()> {
         request_widget_permission(&webview, WidgetPerm::ManageAppWindows)?;
-        set_app_windows_positions(positions)
+        set_app_windows_positions(
+            positions
+                .into_iter()
+                .map(|(id, rect)| (id.hwnd, rect))
+                .collect(),
+        )
     }
 
-    pub fn wm_set_stack_active_window(webview: tauri::WebviewWindow, hwnd: isize) -> Result<()> {
+    pub fn wm_set_stack_active_window(
+        webview: tauri::WebviewWindow,
+        hwnd: WindowIdentity,
+    ) -> Result<()> {
         request_widget_permission(&webview, WidgetPerm::ManageAppWindows)?;
-        let window = Window::from(hwnd);
-        if !window.is_window() {
+        // destroyed or its handle reused by another window: nothing to activate
+        let Ok(window) = Window::try_from(&hwnd) else {
             return Ok(());
-        }
+        };
         WM_STATE.lock().set_stack_active_window(&window)?;
         Ok(())
     }

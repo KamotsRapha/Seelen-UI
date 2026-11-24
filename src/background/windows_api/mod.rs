@@ -2,14 +2,19 @@ mod app_bar;
 mod com;
 mod devices;
 pub mod event_window;
+pub mod icon;
 pub mod input;
 mod iterator;
-pub mod monitor;
-pub mod process;
+pub mod msix;
+pub mod pwsh;
 pub mod string_utils;
 pub mod types;
 pub mod undocumented;
-pub mod window;
+pub mod virtual_desktop;
+pub mod window_badges;
+// partially consumed (app badges), the rest will be used by a future refactor of toasts
+#[allow(dead_code)]
+pub mod wpn_service;
 
 pub use app_bar::*;
 pub use com::*;
@@ -17,9 +22,8 @@ pub use devices::*;
 pub use iterator::*;
 
 use itertools::Itertools;
-use process::ProcessInformationFlag;
 use string_utils::WindowsString;
-use widestring::U16CStr;
+use types::ProcessInformationFlag;
 use windows_core::{Interface, Owned, RuntimeType};
 use windows_future::{AsyncStatus, IAsyncOperation};
 
@@ -48,7 +52,7 @@ use windows::{
             PHYSICAL_MONITOR,
         },
         Foundation::{
-            GetLastError, HANDLE, HMODULE, HWND, LPARAM, LUID, MAX_PATH, POINT, RECT,
+            FILETIME, GetLastError, HANDLE, HMODULE, HWND, LPARAM, LUID, POINT, RECT,
             STATUS_SUCCESS, SetLastError, WIN32_ERROR, WPARAM,
         },
         Graphics::{
@@ -92,8 +96,8 @@ use windows::{
             SystemInformation::{COMPUTER_NAME_FORMAT, GetComputerNameExW},
             Threading::{
                 AttachThreadInput, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
-                OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
-                PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+                GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS,
+                PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
             },
             Variant::VARIANT,
         },
@@ -110,16 +114,14 @@ use windows::{
                 ShellExecuteExW, ShellLink, ShellWindows, VirtualDesktopManager,
             },
             WindowsAndMessaging::{
-                DispatchMessageW, FindWindowExW, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW,
-                GetDesktopWindow, GetForegroundWindow, GetParent, GetPropW, GetWindow,
-                GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-                HWND_BROADCAST, IsIconic, IsWindow, IsWindowVisible, IsZoomed, MSG, PM_REMOVE,
-                PeekMessageW, PostMessageW, SET_WINDOW_POS_FLAGS, SHOW_WINDOW_CMD,
-                SPI_GETDESKWALLPAPER, SPI_SETDESKWALLPAPER, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
-                SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-                SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW,
-                SendNotifyMessageW, SetWindowPos, ShowWindow, ShowWindowAsync,
-                SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+                ASFW_ANY, AllowSetForegroundWindow, DispatchMessageW, FindWindowExW, GW_OWNER,
+                GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetDesktopWindow, GetForegroundWindow,
+                GetParent, GetPropW, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW,
+                GetWindowThreadProcessId, HWND_BROADCAST, IsIconic, IsWindow, IsWindowVisible,
+                IsZoomed, MSG, PM_REMOVE, PeekMessageW, PostMessageW, SET_WINDOW_POS_FLAGS,
+                SHOW_WINDOW_CMD, SW_SHOWNORMAL, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SendNotifyMessageW, SetWindowPos,
+                ShowWindow, ShowWindowAsync, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
                 WM_SETTINGCHANGE, WS_SIZEBOX, WS_THICKFRAME,
             },
         },
@@ -129,8 +131,10 @@ use windows::{
 
 use crate::{
     error::{Result, WindowsResultExt},
-    hook::HookManager,
-    windows_api::window::{Window, event::WinEvent},
+    platform::{
+        hook::{HookManager, WindowEvent},
+        window::Window,
+    },
 };
 
 #[macro_export]
@@ -474,11 +478,11 @@ impl WindowsApi {
 
         // event sometimes is not emitted, so we manually emit it, this will cause 2 foreground events
         // if original was recieved, btw having it twice is better than nothing
-        HookManager::event_tx().send((WinEvent::SystemForeground, window))?;
+        HookManager::event_tx().send((WindowEvent::Foregrounded, window))?;
         Ok(())
     }
 
-    fn open_process(
+    pub fn open_process(
         access_rights: PROCESS_ACCESS_RIGHTS,
         inherit_handle: bool,
         process_id: u32,
@@ -576,6 +580,17 @@ impl WindowsApi {
             QueryFullProcessImageNameW(*handle, PROCESS_NAME_WIN32, path.as_pwstr(), &mut 1024)?;
         }
         Ok(path.to_os_string())
+    }
+
+    /// Creation time of the process as a FILETIME (100ns intervals since 1601-01-01 UTC).
+    pub fn process_creation_time(process_id: u32) -> Result<u64> {
+        let handle = Self::open_process(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)?;
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe { GetProcessTimes(*handle, &mut creation, &mut exit, &mut kernel, &mut user)? };
+        Ok(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
     }
 
     pub fn get_class(hwnd: HWND) -> Result<String> {
@@ -920,7 +935,7 @@ impl WindowsApi {
         let monitors = MonitorEnumerator::enumerate_win32()?;
         let mut rect = RECT::default();
         for (idx, monitor) in monitors.iter().enumerate() {
-            let m_rect = monitor.rect()?;
+            let m_rect = Self::monitor_rect(*monitor)?;
             if idx == 0 {
                 rect.left = m_rect.left;
                 rect.top = m_rect.top;
@@ -978,40 +993,6 @@ impl WindowsApi {
             return Err(format!("Failed to get desktop id for: {hwnd:?}").into());
         }
         Ok(desktop_id)
-    }
-
-    pub fn get_wallpaper() -> Result<PathBuf> {
-        let mut path = [0_u16; MAX_PATH as usize];
-        unsafe {
-            SystemParametersInfoW(
-                SPI_GETDESKWALLPAPER,
-                MAX_PATH,
-                Some(path.as_mut_ptr() as _),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-            )?;
-        }
-        Ok(PathBuf::from(
-            U16CStr::from_slice_truncate(&path)?
-                .to_ustring()
-                .to_string_lossy(),
-        ))
-    }
-
-    pub fn set_wallpaper(path: PathBuf) -> Result<()> {
-        if !path.exists() {
-            return Err("File not found".into());
-        }
-
-        let mut path = WindowsString::from(path);
-        unsafe {
-            SystemParametersInfoW(
-                SPI_SETDESKWALLPAPER,
-                MAX_PATH,
-                Some(path.as_mut_slice().as_mut_ptr() as _),
-                SPIF_SENDCHANGE | SPIF_UPDATEINIFILE,
-            )?;
-        }
-        Ok(())
     }
 
     /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-exitwindowsex
@@ -1161,6 +1142,27 @@ impl WindowsApi {
         })))
     }
 
+    /// Resolve paths with folder ids in the form of "{GUID}\path\to\file"
+    ///
+    /// https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid
+    pub fn resolve_guid_path<S: AsRef<str>>(path: S) -> Result<PathBuf> {
+        let parts = path.as_ref().split("\\");
+        let mut path_buf = PathBuf::new();
+
+        for (idx, part) in parts.into_iter().enumerate() {
+            if part.starts_with("{") && part.ends_with("}") {
+                let guid = part.trim_start_matches('{').trim_end_matches('}');
+                path_buf.push(Self::known_folder(GUID::try_from(guid)?)?);
+            } else if idx == 0 {
+                return Ok(PathBuf::from(path.as_ref()));
+            } else {
+                path_buf.push(part);
+            }
+        }
+
+        Ok(path_buf)
+    }
+
     #[allow(dead_code)]
     pub fn known_folder_item(folder_id: windows::core::GUID) -> Result<()> {
         let item: IShellItem2 = unsafe { SHGetKnownFolderItem(&folder_id, KF_FLAG_DEFAULT, None)? };
@@ -1295,6 +1297,11 @@ impl WindowsApi {
         elevated: bool,
     ) -> Result<()> {
         log::trace!("Running: {program:?} with args: {args:?} in working dir: {working_dir:?}");
+        // The app is launched by explorer (or by us as fallback), which doesn't own the
+        // foreground, so Windows' foreground lock would open it behind the focused window.
+        // Hand our foreground rights to whoever claims them next; this only succeeds while we
+        // hold them (e.g. right after a click on the dock or another widget), so failure is fine.
+        let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
         match Self::shell_execute_through_explorer(&program, &args, &working_dir, elevated) {
             Ok(()) => return Ok(()),
             Err(err) => log::error!("Failed to execute through explorer, falling back: {err}"),

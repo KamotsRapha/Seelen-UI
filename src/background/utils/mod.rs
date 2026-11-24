@@ -1,29 +1,23 @@
+pub mod bond;
 pub mod constants;
 pub mod discord;
-pub mod icon_extractor;
+pub mod event_manager;
 pub mod integrity;
 pub mod lock_free;
-pub mod pwsh;
 pub mod updater;
-pub mod virtual_desktop;
-mod winver;
-
-pub use winver::*;
 
 use std::{
     fs::{File, create_dir_all},
     io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use windows::{
-    Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath},
-    core::GUID,
-};
-
-use crate::{error::Result, windows_api::string_utils::WindowsString};
+use crate::error::Result;
 
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -59,33 +53,6 @@ pub fn atomic_write_file(path: &Path, content: &[u8]) -> Result<()> {
         return Err(err.into());
     }
     Ok(())
-}
-
-/// Resolve paths with folder ids in the form of "{GUID}\path\to\file"
-///
-/// https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid
-pub fn resolve_guid_path<S: AsRef<str>>(path: S) -> Result<PathBuf> {
-    let parts = path.as_ref().split("\\");
-    let mut path_buf = PathBuf::new();
-
-    for (idx, part) in parts.into_iter().enumerate() {
-        if part.starts_with("{") && part.ends_with("}") {
-            let guid = part.trim_start_matches('{').trim_end_matches('}');
-            let rfid = GUID::try_from(guid)?;
-            let string_path = WindowsString::from(unsafe {
-                SHGetKnownFolderPath(&rfid as _, KF_FLAG_DEFAULT, None)?
-            })
-            .to_string();
-
-            path_buf.push(string_path);
-        } else if idx == 0 {
-            return Ok(PathBuf::from(path.as_ref()));
-        } else {
-            path_buf.push(part);
-        }
-    }
-
-    Ok(path_buf)
 }
 
 /// Useful when spawning threads that will allocate a loop or some other blocking operation
@@ -127,12 +94,20 @@ pub fn now_timestamp_as_millis() -> u64 {
     since_the_epoch.as_secs() * 1000 + since_the_epoch.subsec_nanos() as u64 / 1_000_000
 }
 
+/// Generates unique hex names for **files and folders** created by the app
+/// (downloaded assets, extracted icons, thumbnails, wallpaper folders, etc.).
+///
+/// This is NOT meant to be used as a real resource/entity ID: for that use `uuid::Uuid`.
+///
+/// The generator is seeded once per session with the current time in milliseconds (on first
+/// call) and every call returns the previous value + 1. This makes every name of a session
+/// unique even when called in a tight loop (#1965), and easy to trace while debugging: all
+/// the files created in the same session share the same seed and are sorted by creation.
 pub fn date_based_hex_id() -> String {
-    let since_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    format!("{since_epoch:x}")
+    static GENERATOR: LazyLock<AtomicU64> =
+        LazyLock::new(|| AtomicU64::new(now_timestamp_as_millis()));
+    let id = GENERATOR.fetch_add(1, Ordering::Relaxed);
+    format!("{id:x}")
 }
 
 pub fn get_parts_of_inline_command(cmd: &str) -> (String, Option<String>) {
@@ -180,4 +155,16 @@ pub fn collect_files(dir: &Path) -> Vec<PathBuf> {
         .filter(|e| e.file_type().is_file())
         .map(|entry| entry.into_path())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_based_hex_id_is_unique_in_tight_loops() {
+        let ids: std::collections::HashSet<String> =
+            (0..1000).map(|_| date_based_hex_id()).collect();
+        assert_eq!(ids.len(), 1000);
+    }
 }

@@ -23,6 +23,15 @@ Translations:
 - NEVER touch non-English i18n files (no adding, editing, translating or deleting keys). Only edit `en` entries /
   `en.yml`; every other language is handled exclusively by `npm run translate`.
 
+Backward compatibility:
+
+- NEVER introduce nor recommend breaking changes to the app's API: serialized types (`libs/core` types, TS bindings),
+  commands, events, settings/resource files and stored state (e.g. renaming or removing fields, changing a field type in
+  an incompatible way). Prefer compatible alternatives: keep the field name, `#[serde(alias)]`, or accept the old format
+  on deserialization and upgrade it on the next save.
+- If a breaking change is truly unavoidable, keep it minimal and document it under `### breaking changes` in
+  `changelog.md`.
+
 Rust locking order (avoid deadlocks):
 
 1. CLI locks
@@ -41,7 +50,8 @@ Rust mutexes:
 
 Backend architecture rules:
 
-- System modules in `src/background/modules/` MUST follow the modern pattern (lazy init + lazy tauri registration).
+- System modules in `src/background/system_modules/` MUST follow the OS-agnostic pattern documented in
+  `src/background/system_modules/mod.rs` (lazy init + lazy tauri registration, OS code only behind the module trait).
 - Business logic must NOT call `emit_to_webviews` directly.
 - Never write `#[tauri::command]` by hand. Commands are declared once in `libs/core/src/handlers/commands.rs`
   (`slu_commands_declaration!`) and their Tauri wrappers are generated at compile time; implement the handler body as a
@@ -136,20 +146,25 @@ Internationalization:
 
 ## Backend: System Modules (Modern Pattern)
 
-All modules in `src/background/modules/` follow this pattern:
+All modules in `src/background/system_modules/` follow this pattern (full rules in
+`src/background/system_modules/mod.rs`, reference module: `focus_assist`):
 
-- `application.rs` owns the singleton manager and emits internal events.
-- `infrastructure.rs` (or `handlers.rs`) owns Tauri commands and bridges internal events -> webviews.
+- `mod.rs` is the infrastructure: Tauri handlers + bridge of internal events -> webviews. OS-agnostic.
+- `domain.rs` holds pure types and the `<Module>System` trait (the OS contract).
+- `application/mod.rs` owns the singleton manager and emits internal events; it only talks to the OS through the trait
+  (`type Platform = windows::Windows<Module>`).
+- `application/windows.rs` (or `windows/`) implements the trait; it owns the OS resources and releases them on `Drop`.
 - Tauri event registration happens lazily on first command access (via `Once`).
 
-Suggested layout:
+Layout:
 
 ```
-src/background/modules/<module>/
-  mod.rs
-  application.rs
-  infrastructure.rs  # or handlers.rs
-  domain.rs          # optional
+src/background/system_modules/<module>/
+  mod.rs               # infrastructure
+  domain.rs
+  application/
+    mod.rs             # manager
+    windows.rs         # #[cfg(windows)] native impl
 ```
 
 Minimal pattern (infrastructure side):
@@ -185,52 +200,83 @@ Handler methods are plain functions, not Tauri commands — no `#[tauri::command
 `async`/return-type plumbing. The wrapper that Tauri actually invokes is generated from the declaration in
 `libs/core/src/handlers/commands.rs` (see below) and calls `Handlers::your_command(...)` for you.
 
-Minimal pattern (application side):
+Minimal pattern (domain side, the OS contract):
 
 ```rust
-use std::sync::LazyLock;
+use crate::error::Result;
 
-pub struct YourManager {
-    // fields
+pub trait YourSystem: Sized + Send + Sync {
+    /// Never fails: no OS calls here, resources are acquired in `init`.
+    fn create() -> Self;
+
+    /// Acquires the OS resources and starts listening, reporting changes through `on_event`.
+    fn init<F>(&mut self, on_event: F) -> Result<()>
+    where
+        F: Fn(YourEvent) + Send + Sync + 'static;
+
+    fn get_data(&self) -> Result<Vec<YourType>>;
 }
 
 #[derive(Debug, Clone)]
 pub enum YourEvent {
     DataChanged,
 }
+```
+
+Minimal pattern (application side, the manager):
+
+```rust
+#[cfg(windows)]
+mod windows;
+
+use std::sync::LazyLock;
+
+use crate::{error::{Result, ResultLogExt}, event_manager};
+use super::domain::{YourEvent, YourSystem};
+
+#[cfg(windows)]
+type Platform = windows::WindowsYour;
+
+pub struct YourManager {
+    platform: Platform,
+}
 
 event_manager!(YourManager, YourEvent);
 
 impl YourManager {
-    fn new() -> Self {
-        Self { /* init */ }
-    }
-
     pub fn instance() -> &'static Self {
         static MANAGER: LazyLock<YourManager> = LazyLock::new(|| {
-            let mut m = YourManager::new();
-            m.init().log_error();
+            let mut m = YourManager::create();
+            m.init().log_error(); // never panic: a failed init leaves a degraded manager
             m
         });
         &MANAGER
     }
 
-    fn init(&mut self) -> Result<()> {
-        self.setup_listeners()?;
-        Ok(())
+    fn create() -> Self {
+        Self { platform: Platform::create() }
     }
 
-    fn setup_listeners(&mut self) -> Result<()> {
-        // Listen to OS signals; emit internal YourEvent::* (not webview events)
-        Ok(())
+    fn init(&mut self) -> Result<()> {
+        // The OS layer never knows about the manager: it reports through the callback.
+        self.platform.init(Self::send)
     }
 
     pub fn get_data(&self) -> Vec<YourType> {
-        // return data
-        vec![]
+        self.platform.get_data().unwrap_or_default()
     }
 }
 ```
+
+`application/windows.rs` implements `YourSystem for WindowsYour`: Win32/WinRT/COM calls and Win32 -> domain conversions
+only. Native resources acquired in `init` are stored as `Option<_>` (queries return `Err` while `None`) and released on
+`Drop`, which must handle a partially initialized struct. Mutable manager state goes in fields behind a `TracedMutex`,
+never the whole manager. Only `windows*` files may use `windows`, `windows_api` or `unsafe`.
+
+OS primitives shared by several modules/widgets (windows of other apps, monitors, processes, paths, startup, global
+hook) live in `src/background/platform/<primitive>/`: an OS-agnostic `mod.rs` that forwards to a `#[cfg(windows)]`
+`windows.rs` (no traits, newtypes over the native handle, Windows-only extras through `Windows*Ext` traits). `platform/`
+must not depend on its consumers.
 
 When adding a new backend feature exposed to the UI, update `libs/core`:
 
@@ -264,8 +310,8 @@ slu_commands_declaration! {
 }
 ```
 
-Then implement each handler as a plain method on `Handlers` in the owning module's `infrastructure.rs` (see the
-"Backend: System Modules" pattern above) — never annotate it with `#[tauri::command]` yourself.
+Then implement each handler as a plain method on `Handlers` in the owning module's `mod.rs` (its infrastructure layer)
+(see the "Backend: System Modules" pattern above) — never annotate it with `#[tauri::command]` yourself.
 
 2. `libs/core/src/handlers/events.rs`
 
@@ -429,7 +475,7 @@ Rust files must always declare their items in this order (after the `use` import
 5. Utility (free) functions
 6. `#[cfg(test)] mod tests`
 
-Reference: `src/background/modules/notifications/wpn_service.rs`.
+Reference: `src/background/windows_api/wpn_service.rs`.
 
 ## Rust Types: Tagged Enums (Serde)
 
@@ -457,6 +503,10 @@ pub enum Action {
 
 - Prefer quick feedback loops (`cargo check`, `npm run type-check`, `deno lint`).
 - Keep changes scoped; add tests when behavior changes.
+- Automated tests must never require the system GUI: no real windows, DWM, focus/foreground, Z-order, input, monitors or
+  an interactive desktop (no `CreateWindowExW` fixtures, no `#[ignore]`d "interactive desktop" tests). Test only the
+  pure logic (extract it from the OS calls if needed). Anything that needs the system GUI is verified manually by
+  QA/testers: list those scenarios in the PR description instead of writing a test.
 - Runtime logs can be read directly (no need to ask the user for them):
   `%LOCALAPPDATA%\com.seelen.seelen-ui\logs\Seelen UI.log` (service: `SLU Service.log` in the same folder; previous
   session in `*.log.bak`).

@@ -4,14 +4,13 @@ pub use slu_ipc::commands::{Axis, Direction, Sizing, StepWay, WindowManagerCli, 
 use seelen_core::state::twm::TwmReservation;
 
 use crate::error::Result;
-use crate::state::application::FULL_STATE;
+use crate::platform::monitor::Monitor;
+use crate::platform::window::Window;
+use crate::state::FULL_STATE;
 use crate::virtual_desktops::VdManager;
 use crate::widgets::window_manager::state_v2::{
     TwmState, TwmStateEvent, WM_STATE, twm_set_rect_to_float_initial_size,
 };
-use crate::windows_api::MonitorEnumerator;
-use crate::windows_api::monitor::Monitor;
-use crate::windows_api::window::Window;
 
 fn to_wm_reservation(side: AllowedReservations) -> TwmReservation {
     match side {
@@ -61,10 +60,10 @@ fn process_wm_command(cmd: WmCommand) -> Result<()> {
             WM_STATE.lock().cancel_reservation();
         }
         WmCommand::ResetWorkspaceSize => {
-            let window_id = foreground.address();
+            let hwnd = foreground.handle();
             let mut guard = WM_STATE.lock();
-            if guard.state.contains(&window_id) {
-                if guard.state.is_tiled(&window_id) {
+            if guard.state.contains(hwnd) {
+                if guard.state.is_tiled(hwnd) {
                     if let Some((_, tree)) = guard.get_tree_for_window_mut(&foreground) {
                         tree.reset_sizes();
                         TwmState::send(TwmStateEvent::Changed);
@@ -79,7 +78,7 @@ fn process_wm_command(cmd: WmCommand) -> Result<()> {
             if !state.is_managed(&foreground) {
                 return Ok(());
             }
-            let workspace_id = foreground.workspace_id()?;
+            let workspace_id = VdManager::instance().workspace_of(&foreground)?;
             if state.is_tiled(&foreground) {
                 state.remove(&foreground);
                 state.add_to_floating(&foreground, &workspace_id);
@@ -99,7 +98,7 @@ fn process_wm_command(cmd: WmCommand) -> Result<()> {
             WM_STATE.lock().toggle_monocle(&workspace_id);
         }
         WmCommand::Focus { side } | WmCommand::Move { side } => {
-            let window_id = foreground.address();
+            let window_id = foreground.handle();
             let fg_rect = foreground.inner_rect()?;
 
             let mut guard = WM_STATE.lock();
@@ -213,7 +212,7 @@ fn process_move_to_monitor(foreground: &Window, side: Direction) -> Result<()> {
 }
 
 pub fn get_neartest_monitor_at_side(monitor: &Monitor, side: Direction) -> Result<Option<Monitor>> {
-    let monitors = MonitorEnumerator::enumerate_win32()?;
+    let monitors = Monitor::enumerate()?;
     let center = monitor.rect()?.center();
 
     let mut best: Option<(Monitor, i32)> = None;

@@ -23,23 +23,18 @@ use seelen_core::{
         Alignment, WidgetDebugInfo, WidgetInstanceMode, WidgetStatus, WidgetTriggerPayload,
         context_menu::ContextMenu, dialog::Dialog,
     },
-    system_state::{AppBarEdge, ZOrder},
+    system_state::{AppBarEdge, WindowHandle, WindowIdentity, ZOrder},
 };
 use tauri::{Emitter, Manager};
-use windows::Win32::Foundation::{HWND, RECT};
 
 use crate::{
     app::{emit_to_webviews, get_app_handle},
     error::Result,
+    platform::{cursor, shell},
     resources::RESOURCES,
-    state::application::FULL_STATE,
+    state::FULL_STATE,
     utils::{atomic_write_file, constants::SEELEN_COMMON, lock_free::SyncHashMap},
     widgets::{manager::WIDGET_MANAGER, webview::WidgetWebviewLabel},
-    windows_api::{
-        AppBarData, WindowsApi,
-        input::{Keyboard, Mouse},
-        window::Window,
-    },
 };
 
 static PENDING_TRIGGERS: LazyLock<SyncHashMap<WidgetWebviewLabel, WidgetTriggerPayload>> =
@@ -47,7 +42,7 @@ static PENDING_TRIGGERS: LazyLock<SyncHashMap<WidgetWebviewLabel, WidgetTriggerP
 
 fn trigger_widget_inner(
     mut payload: WidgetTriggerPayload,
-    owner_hwnd: Option<isize>,
+    owner_hwnd: Option<WindowHandle>,
 ) -> Result<()> {
     let state = FULL_STATE.load();
     if !state.is_widget_enabled(&payload.id) {
@@ -87,11 +82,11 @@ fn trigger_widget_inner(
     }
 
     match &mut payload.desired_position {
-        None => payload.desired_position = Some(Mouse::get_cursor_pos()?),
+        None => payload.desired_position = Some(cursor::position()?),
         // `i32::MIN` marks an axis as unset, so it falls back to the cursor position on
         // that axis while keeping the caller-provided value on the other.
         Some(pos) if pos.x == i32::MIN || pos.y == i32::MIN => {
-            let cursor = Mouse::get_cursor_pos()?;
+            let cursor = cursor::position()?;
             if pos.x == i32::MIN {
                 pos.x = cursor.x;
             }
@@ -165,7 +160,9 @@ pub fn notify_widget_statuses_change() {
                     monitor_id: pod.label.monitor_id.as_ref().map(|m| m.to_string()),
                     instance_id: pod.label.instance_id.map(|id| id.to_string()),
                     status: *pod.status(),
-                    webview_window_id: pod.hwnd(),
+                    webview_window_id: pod
+                        .hwnd()
+                        .map(|h| crate::platform::window::Window::from(h).id()),
                 });
             });
         });
@@ -222,7 +219,7 @@ impl crate::tauri_handlers::Handlers {
         forward_to: Option<String>,
     ) -> Result<()> {
         let owner = WidgetWebviewLabel::try_from_raw(webview.label())?;
-        let owner_hwnd = webview.hwnd()?.0 as isize;
+        let owner_hwnd = webview::native_window(&webview)?.handle();
 
         let mut payload = WidgetTriggerPayload::new("@seelen/context-menu".into());
         payload.instance_id = Some(menu.identifier);
@@ -241,7 +238,7 @@ impl crate::tauri_handlers::Handlers {
     /// Trigger a dialog from within a widget (the owner webview is used for event routing).
     pub fn trigger_dialog(webview: tauri::WebviewWindow, dialog: Dialog) -> Result<()> {
         let owner = WidgetWebviewLabel::try_from_raw(webview.label())?;
-        let owner_hwnd = webview.hwnd()?.0 as isize;
+        let owner_hwnd = webview::native_window(&webview)?.handle();
 
         let mut payload = WidgetTriggerPayload::new("@seelen/dialog".into());
         payload.instance_id = Some(dialog.identifier);
@@ -252,8 +249,8 @@ impl crate::tauri_handlers::Handlers {
         trigger_widget_inner(payload, Some(owner_hwnd))
     }
 
-    pub fn get_self_window_handle(webview: tauri::WebviewWindow) -> Result<isize> {
-        Ok(webview.hwnd()?.0 as isize)
+    pub fn get_self_window_handle(webview: tauri::WebviewWindow) -> Result<WindowIdentity> {
+        Ok(webview::native_window(&webview)?.id())
     }
 
     pub fn normalize_self_device_pixel_ratio(webview: tauri::WebviewWindow) -> Result<()> {
@@ -261,54 +258,15 @@ impl crate::tauri_handlers::Handlers {
     }
 
     pub fn set_self_position(webview: tauri::WebviewWindow, rect: Rect) -> Result<()> {
-        use windows::Win32::Graphics::Gdi::*;
-        use windows::Win32::UI::WindowsAndMessaging::SWP_ASYNCWINDOWPOS;
-
-        let hwnd = HWND(webview.hwnd()?.0);
-        let rect = RECT {
-            left: rect.left,
-            top: rect.top,
-            right: rect.right,
-            bottom: rect.bottom,
-        };
-
-        // pre set position for resize in case of multiples dpi
-        WindowsApi::move_window(hwnd, &rect)?;
-        WindowsApi::set_position(hwnd, None, &rect, SWP_ASYNCWINDOWPOS)?;
-        // ensure child windows are redrawn
-        unsafe {
-            let _ = RedrawWindow(
-                Some(hwnd),
-                None,
-                None,
-                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_FRAME | RDW_ERASE,
-            );
-        }
-        Ok(())
+        webview::set_position(&webview, &rect)
     }
 
     pub fn set_self_z_order(webview: tauri::WebviewWindow, z_order: ZOrder) -> Result<()> {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST,
-        };
-        let hwnd = HWND(webview.hwnd()?.0);
-
-        WindowsApi::set_z_order(
-            hwnd,
-            match z_order {
-                ZOrder::TopMost => HWND_TOPMOST,
-                ZOrder::NoTopMost => HWND_NOTOPMOST,
-                ZOrder::Top => HWND_TOP,
-                ZOrder::Bottom => HWND_BOTTOM,
-            },
-        )?;
-
-        Ok(())
+        webview::native_window(&webview)?.set_z_order(z_order)
     }
 
     pub fn request_focus(webview: tauri::WebviewWindow) -> Result<()> {
-        let hwnd = webview.hwnd()?.0 as isize;
-        let window = Window::from(hwnd);
+        let window = webview::native_window(&webview)?;
         if !window.is_window() {
             return Ok(());
         }
@@ -322,8 +280,7 @@ impl crate::tauri_handlers::Handlers {
             Self::trigger_widget(WidgetTriggerPayload::new("@seelen/apps-menu".into()))?;
             return Ok(());
         }
-        // trick for showing the native start menu
-        Keyboard::new().send_keys("{win}")
+        shell::open_native_start_menu()
     }
 
     pub fn write_data_file(
@@ -353,7 +310,9 @@ impl crate::tauri_handlers::Handlers {
                     monitor_id: pod.label.monitor_id.as_ref().map(|m| m.to_string()),
                     instance_id: pod.label.instance_id.map(|id| id.to_string()),
                     status: *pod.status(),
-                    webview_window_id: pod.hwnd(),
+                    webview_window_id: pod
+                        .hwnd()
+                        .map(|h| crate::platform::window::Window::from(h).id()),
                 });
             });
         });
@@ -376,27 +335,13 @@ impl crate::tauri_handlers::Handlers {
         let label = WidgetWebviewLabel::try_from_raw(webview.label())?;
         log::info!(target: &label.decoded, "Registering as Shell Bar");
 
-        let hwnd = HWND(webview.hwnd()?.0);
-        let rect = RECT {
-            left: rect.left,
-            top: rect.top,
-            right: rect.right,
-            bottom: rect.bottom,
-        };
-        let mut app_bar = AppBarData::from_handle(hwnd);
-        app_bar.set_rect(rect);
-        app_bar.set_edge(edge);
-        app_bar.register_as_new_bar()?;
-        Ok(())
+        webview::register_app_bar(&webview, &rect, edge)
     }
 
     pub fn unregister_app_bar(webview: tauri::WebviewWindow) -> Result<()> {
         let label = WidgetWebviewLabel::try_from_raw(webview.label())?;
         log::info!(target: &label.decoded, "Unregistering as Shell Bar");
 
-        let hwnd = HWND(webview.hwnd()?.0);
-        let mut app_bar = AppBarData::from_handle(hwnd);
-        app_bar.unregister_bar()?;
-        Ok(())
+        webview::unregister_app_bar(&webview)
     }
 }

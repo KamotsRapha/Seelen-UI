@@ -3,7 +3,10 @@ use std::{
     time::Duration,
 };
 
-use seelen_core::state::{Widget, WidgetInstanceMode, WidgetStatus};
+use seelen_core::{
+    state::{Widget, WidgetInstanceMode, WidgetStatus},
+    system_state::WindowHandle,
+};
 use tauri::{Emitter, Listener};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use uuid::Uuid;
@@ -11,9 +14,9 @@ use uuid::Uuid;
 use crate::{
     app::get_app_handle,
     get_tokio_handle,
-    modules::monitors::MonitorManager,
     resources::RESOURCES,
-    state::application::FULL_STATE,
+    state::FULL_STATE,
+    system_modules::monitors::MonitorManager,
     utils::lock_free::SyncHashMap,
     widgets::{
         WidgetWebviewLabel,
@@ -21,7 +24,6 @@ use crate::{
         notify_widget_statuses_change,
         webview::{self, WidgetWebview},
     },
-    windows_api::event_window::IS_INTERACTIVE_SESSION,
 };
 
 pub enum PodSource {
@@ -142,7 +144,7 @@ impl WidgetDeployment {
         });
     }
 
-    pub fn create_runtime_instance(&self, instance_id: &Uuid, owner_hwnd: Option<isize>) {
+    pub fn create_runtime_instance(&self, instance_id: &Uuid, owner_hwnd: Option<WindowHandle>) {
         let label = WidgetWebviewLabel::new(&self.definition.id, None, Some(instance_id));
         let instance = WidgetPod::create(label, owner_hwnd, PodSource::Runtime);
         self.pods.upsert(instance.label.clone(), instance);
@@ -159,7 +161,7 @@ pub struct WidgetPod {
 
     window: Option<WidgetWebview>,
     _status: WidgetStatus,
-    owner_hwnd: Option<isize>,
+    owner_hwnd: Option<WindowHandle>,
 
     live: Arc<tokio::sync::Notify>,
     liveness_prove_handle: Option<tokio::task::JoinHandle<()>>,
@@ -168,7 +170,11 @@ pub struct WidgetPod {
 }
 
 impl WidgetPod {
-    fn create(label: WidgetWebviewLabel, owner_hwnd: Option<isize>, source: PodSource) -> Self {
+    fn create(
+        label: WidgetWebviewLabel,
+        owner_hwnd: Option<WindowHandle>,
+        source: PodSource,
+    ) -> Self {
         Self {
             label,
             source,
@@ -186,8 +192,10 @@ impl WidgetPod {
         &self._status
     }
 
-    pub fn hwnd(&self) -> Option<isize> {
-        self.window.as_ref()?.0.hwnd().ok().map(|h| h.0 as isize)
+    pub fn hwnd(&self) -> Option<WindowHandle> {
+        webview::native_window(&self.window.as_ref()?.0)
+            .ok()
+            .map(|window| window.handle())
     }
 
     pub fn set_status(&mut self, status: WidgetStatus) {
@@ -297,7 +305,7 @@ impl WidgetPod {
 
             loop {
                 tokio::time::sleep(LIVENESS_PROVE_INTERVAL).await;
-                if !IS_INTERACTIVE_SESSION.load(std::sync::atomic::Ordering::Acquire) {
+                if !crate::platform::session::is_interactive() {
                     was_suspended = true;
                     continue;
                 }
